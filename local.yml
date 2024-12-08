@@ -1,0 +1,190 @@
+---
+- name: Configure Proxmox Thunderbolt Networking and Intel Microcode
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    intel_microcode_url: "http://ftp.us.debian.org/debian/pool/non-free-firmware/i/intel-microcode/intel-microcode_3.20241112.1_amd64.deb"
+    # Kernel modules to enable
+    tb_modules:
+      - thunderbolt
+      - thunderbolt-net
+
+    # Network interfaces configuration
+    network_interfaces_conf: |
+      iface en05 inet manual
+      #Thunderbolt Network (do not edit it GUI)
+
+      iface en06 inet manual
+      #Thunderbolt Network (do not edit it GUI)
+
+    # Systemd .link files configuration
+    thunderbolt0_link: |
+      [Match]
+      Path=pci-0000:00:0d.2
+      Driver=thunderbolt-net
+      [Link]
+      MACAddressPolicy=none
+      Name=en05
+
+    thunderbolt1_link: |
+      [Match]
+      Path=pci-0000:00:0d.3
+      Driver=thunderbolt-net
+      [Link]
+      MACAddressPolicy=none
+      Name=en06
+
+    # Udev rules
+    udev_rules: |
+      ACTION=="move", SUBSYSTEM=="net", KERNEL=="en05", RUN+="/usr/local/bin/pve-en05.sh"
+      ACTION=="move", SUBSYSTEM=="net", KERNEL=="en06", RUN+="/usr/local/bin/pve-en06.sh"
+
+    # Script content for pve-en05.sh
+    pve_en05_script: |
+      #!/bin/bash
+      for i in {1..10}; do
+          /usr/sbin/ifup en05 && break
+          sleep 3
+      done
+
+    # Script content for pve-en06.sh
+    pve_en06_script: |
+      #!/bin/bash
+      for i in {1..10}; do
+          /usr/sbin/ifup en06 && break
+          sleep 3
+      done
+
+    # Grub configuration lines to ensure exist
+    grub_cmdline_linux_default: 'GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt mitigations=off"'
+    grub_serial_command: 'GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"'
+    grub_cmdline_linux: 'GRUB_CMDLINE_LINUX="console=tty1 console=ttyS4,115200n8"'
+    grub_terminal: 'GRUB_TERMINAL="console serial"'
+    grub_timeout_line: 'GRUB_TIMEOUT=10'
+
+  tasks:
+    - name: Install Intel microcode directly via apt
+      apt:
+        deb: "{{ intel_microcode_url }}"
+        state: present
+      register: microcode_install
+      notify: Reboot Host
+
+    - name: Install required packages
+      apt:
+        name:
+          - lldpd
+          - iperf
+        state: present
+        update_cache: true
+      register: pkg_install
+      notify: Reboot Host
+
+    - name: Ensure kernel modules are listed in /etc/modules
+      lineinfile:
+        path: /etc/modules
+        line: "{{ item }}"
+        insertafter: EOF
+      loop: "{{ tb_modules }}"
+      register: modules_add
+      notify: Reboot Host
+
+    - name: Ensure thunderbolt interfaces are in /etc/network/interfaces
+      blockinfile:
+        path: /etc/network/interfaces
+        insertafter: EOF
+        block: "{{ network_interfaces_conf }}"
+      register: network_conf
+      notify: Reboot Host
+
+    - name: Create systemd-networkd .link files for thunderbolt interfaces
+      copy:
+        dest: "/etc/systemd/network/{{ item.name }}"
+        content: "{{ item.content }}"
+        mode: '0644'
+      loop:
+        - { name: "00-thunderbolt0.link", content: "{{ thunderbolt0_link }}" }
+        - { name: "00-thunderbolt1.link", content: "{{ thunderbolt1_link }}" }
+      register: link_files
+      notify: Reboot Host
+
+    - name: Create udev rule for thunderbolt interfaces
+      copy:
+        dest: /etc/udev/rules.d/10-tb-en.rules
+        content: "{{ udev_rules }}"
+        mode: '0644'
+      register: udev_rules_result
+      notify: Reboot Host
+
+    - name: Create pve-en05.sh script
+      copy:
+        dest: /usr/local/bin/pve-en05.sh
+        content: "{{ pve_en05_script }}"
+        mode: '0755'
+      register: script_en05
+      notify: Reboot Host
+
+    - name: Create pve-en06.sh script
+      copy:
+        dest: /usr/local/bin/pve-en06.sh
+        content: "{{ pve_en06_script }}"
+        mode: '0755'
+      register: script_en06
+      notify: Reboot Host
+
+    - name: Update initramfs
+      command: update-initramfs -u -k all
+      register: initramfs_update
+      notify: Reboot Host
+
+    - name: Ensure GRUB_CMDLINE_LINUX_DEFAULT line is present
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX_DEFAULT='
+        line: '{{ grub_cmdline_linux_default }}'
+      register: grub_default
+      notify: Reboot Host
+
+    - name: Ensure GRUB_SERIAL_COMMAND line is present
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_SERIAL_COMMAND='
+        line: '{{ grub_serial_command }}'
+      register: grub_serial
+      notify: Reboot Host
+
+    - name: Ensure GRUB_CMDLINE_LINUX line is present
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX='
+        line: '{{ grub_cmdline_linux }}'
+      register: grub_cmdline
+      notify: Reboot Host
+
+    - name: Ensure GRUB_TERMINAL line is present
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_TERMINAL='
+        line: '{{ grub_terminal }}'
+      register: grub_terminal_conf
+      notify: Reboot Host
+
+    - name: Set GRUB timeout to 10 seconds
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_TIMEOUT='
+        line: '{{ grub_timeout_line }}'
+      register: grub_timeout
+      notify: Reboot Host
+
+    - name: Update grub configuration
+      command: update-grub2
+      register: grub_update
+      notify: Reboot Host
+
+  handlers:
+    - name: Reboot Host
+      reboot:
+        msg: "Rebooting due to configuration changes..."
